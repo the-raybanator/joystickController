@@ -1,142 +1,158 @@
 #include <Arduino.h>
+#include <SoftwareSerial.h>
 
-// joystick
-const int JOY_X_PIN = A0;  // X-axis analog input
-const int JOY_Y_PIN = A1;  // Y-axis analog input
-const int SWITCH_PIN = 8;
+// ============================================================
+// Low-traffic design: instead of streaming lines constantly, the Arduino sends
+// ONE small snapshot of everything ("S" + 4 hex digits + 1 checksum digit,
+// e.g. "S00A1B") only when something changes, plus a heartbeat every
+// HEARTBEAT_MS so the PC stays in sync and can detect a dropped link.
+// All repeating / holding / mouse movement is done on the PC side.
+// ============================================================
 
-// Non-blocking timer variable for Serial streaming
-unsigned long lastPrintTime = 0;
-const unsigned long PRINT_INTERVAL = 50; // Stream joystick data every 50ms
+// ---- HC-05 Bluetooth (SoftwareSerial) ----
+// NOTE: set these to whatever pins your HC-05 is actually wired to.
+// HC-05 TX -> BT_RX_PIN
+// HC-05 RX <- BT_TX_PIN (through a voltage divider)
+const int BT_RX_PIN = A3;
+const int BT_TX_PIN = A2;
+const long BT_BAUD = 9600;       // HC-05 default data baud rate
+SoftwareSerial bt(BT_RX_PIN, BT_TX_PIN);
 
-// pushbuttons (wired between pin and GND, using INPUT_PULLUP)
-const unsigned long DEBOUNCE_MS = 25;  // input must be stable this long to count
+// Mirror snapshots to USB serial for debugging (0 = Bluetooth only).
+#define DEBUG_USB 0
 
-// Shape buttons: tap = one output, hold past the delay = slow repeat
-const unsigned long SHAPE_HOLD_DELAY_MS = 600;
-const unsigned long SHAPE_REPEAT_MS = 150;
+// ---- Bit positions in the state word (must match the Python script) ----
+enum StateBit {
+  B_TRIANGLE = 0,
+  B_CIRCLE   = 1,
+  B_X        = 2,
+  B_SQUARE   = 3,
+  B_UP       = 4,
+  B_RIGHT    = 5,
+  B_DOWN     = 6,
+  B_LEFT     = 7,
+  B_SHOOT    = 8,
+  B_AIM      = 9,   // latching switch: bit stays set while the switch is on
+  B_JLEFT    = 10,
+  B_JRIGHT   = 11,
+  B_JUP      = 12,
+  B_JDOWN    = 13,
+  B_JSW      = 14   // joystick push-switch
+};
 
-// Direction buttons: continuous. Output starts immediately and keeps coming
-// every DIR_REPEAT_MS for as long as the button is held (no hold delay).
-const unsigned long DIR_HOLD_DELAY_MS = 0;
-const unsigned long DIR_REPEAT_MS = 20;  // ~50 outputs/sec (lower = faster)
+uint16_t state = 0;
 
-struct Button {
-  const char* name;
+// ---- Digital inputs (wired between pin and GND, INPUT_PULLUP) ----
+const unsigned long DEBOUNCE_MS = 25;  // input must be steady this long to count
+
+struct Input {
   uint8_t pin;
-  unsigned long holdDelay;  // how long to hold before repeating starts
-  unsigned long repeatMs;   // time between repeats once repeating
-  bool stableState;         // debounced state: true = pressed
-  bool lastReading;         // raw reading from the previous pass
-  unsigned long lastChange; // when the raw reading last flipped
-  unsigned long nextRepeat; // when the next repeat is due while held
+  uint8_t bit;
+  bool stable;               // debounced state (true = pressed / switch on)
+  bool lastReading;          // raw reading from the previous pass
+  unsigned long lastChange;  // when the raw reading last flipped
 };
 
-Button buttons[] = {
-  // shapes
-  {"TRIANGLE", 4,  SHAPE_HOLD_DELAY_MS, SHAPE_REPEAT_MS, false, false, 0, 0},
-  {"CIRCLE",   5,  SHAPE_HOLD_DELAY_MS, SHAPE_REPEAT_MS, false, false, 0, 0},
-  {"X",        6,  DIR_HOLD_DELAY_MS,   DIR_REPEAT_MS,   false, false, 0, 0},  // continuous
-  {"SQUARE",   7,  SHAPE_HOLD_DELAY_MS, SHAPE_REPEAT_MS, false, false, 0, 0},
-  // directions (continuous)
-  {"UP",       9,  DIR_HOLD_DELAY_MS,   DIR_REPEAT_MS,   false, false, 0, 0},
-  {"RIGHT",    10, DIR_HOLD_DELAY_MS,   DIR_REPEAT_MS,   false, false, 0, 0},
-  {"DOWN",     11, DIR_HOLD_DELAY_MS,   DIR_REPEAT_MS,   false, false, 0, 0},
-  {"LEFT",     12, DIR_HOLD_DELAY_MS,   DIR_REPEAT_MS,   false, false, 0, 0},
-  // shoot (continuous)
-  {"SHOOT",    13, DIR_HOLD_DELAY_MS,   DIR_REPEAT_MS,   false, false, 0, 0},
+Input inputs[] = {
+  {4,  B_TRIANGLE, false, false, 0},
+  {5,  B_CIRCLE,   false, false, 0},
+  {6,  B_X,        false, false, 0},
+  {7,  B_SQUARE,   false, false, 0},
+  {9,  B_UP,       false, false, 0},
+  {10, B_RIGHT,    false, false, 0},
+  {11, B_DOWN,     false, false, 0},
+  {12, B_LEFT,     false, false, 0},
+  {13, B_SHOOT,    false, false, 0},
+  {3,  B_AIM,      false, false, 0},   // aim switch
+  {8,  B_JSW,      false, false, 0},   // joystick push-switch
 };
-const int NUM_BUTTONS = sizeof(buttons) / sizeof(buttons[0]);
+const int NUM_INPUTS = sizeof(inputs) / sizeof(inputs[0]);
 
-void read_joystick() {
-  // ensure Serial monitor doesn't crash
-  if (millis() - lastPrintTime >= PRINT_INTERVAL) {
-    lastPrintTime = millis();
+// ---- Joystick (analog) ----
+const int JOY_X_PIN = A0;
+const int JOY_Y_PIN = A1;
+const int JOY_LOW = 300;    // below this = pushed toward low end
+const int JOY_HIGH = 700;   // above this = pushed toward high end
+const int JOY_HYST = 40;    // must come back this far past a threshold to release
 
-    int xValue = analogRead(JOY_X_PIN);
-    int yValue = analogRead(JOY_Y_PIN);
-    int switchValue = digitalRead(SWITCH_PIN);
+int xDir = 0, yDir = 0;     // -1, 0, +1
 
-    Serial.print(xValue);
-    Serial.print(",");
-    Serial.print(yValue);
-    Serial.print(",");
-    Serial.println(switchValue);
-  }
+int axisDir(int v, int cur) {
+  if (cur < 0 && v < JOY_LOW + JOY_HYST) return -1;
+  if (cur > 0 && v > JOY_HIGH - JOY_HYST) return 1;
+  if (v < JOY_LOW) return -1;
+  if (v > JOY_HIGH) return 1;
+  return 0;
 }
 
-// Prints the button name once per press, then repeats it while held
-// (after holdDelay, every repeatMs). Direction buttons have holdDelay = 0,
-// so they stream continuously from the moment they are pressed.
-void read_pushbtn() {
+void setBit(uint8_t bit, bool on) {
+  if (on) state |= (1u << bit);
+  else state &= ~(1u << bit);
+}
+
+void update_inputs() {
   unsigned long now = millis();
+  for (int i = 0; i < NUM_INPUTS; i++) {
+    Input &in = inputs[i];
+    bool reading = (digitalRead(in.pin) == LOW);   // LOW = pressed (pull-up)
 
-  for (int i = 0; i < NUM_BUTTONS; i++) {
-    Button &b = buttons[i];
-    bool reading = (digitalRead(b.pin) == LOW);  // LOW = pressed (pull-up)
-
-    if (reading != b.lastReading) {
-      b.lastChange = now;       // raw signal changed, restart the debounce timer
-      b.lastReading = reading;
+    if (reading != in.lastReading) {
+      in.lastChange = now;                         // changed: restart debounce
+      in.lastReading = reading;
     }
-
-    if ((now - b.lastChange) >= DEBOUNCE_MS && reading != b.stableState) {
-      b.stableState = reading;  // signal has been steady long enough
-      if (reading) {
-        Serial.println(b.name);                // the first press event
-        b.nextRepeat = now + b.holdDelay + b.repeatMs;
-        if (b.holdDelay > 0) b.nextRepeat = now + b.holdDelay;
-      }
-    }
-
-    // still held: keep repeating
-    if (b.stableState && now >= b.nextRepeat) {
-      Serial.println(b.name);
-      b.nextRepeat = now + b.repeatMs;
+    if ((now - in.lastChange) >= DEBOUNCE_MS && reading != in.stable) {
+      in.stable = reading;
+      setBit(in.bit, in.stable);
     }
   }
 }
 
-// Aim switch (a latching switch, NOT a pushbutton): wired between pin 3 and GND.
-// Switch closed = aiming. Sends "AIM_ON" once when switched on and
-// "AIM_OFF" once when switched off.
-const int AIM_PIN = 3;
-bool aimStable = false;         // debounced state: true = switch on
-bool aimLastReading = false;
-unsigned long aimLastChange = 0;
+void update_joystick() {
+  int x = analogRead(JOY_X_PIN);
+  int y = analogRead(JOY_Y_PIN);
+  xDir = axisDir(x, xDir);
+  yDir = axisDir(y, yDir);
+  setBit(B_JLEFT,  xDir < 0);
+  setBit(B_JRIGHT, xDir > 0);
+  setBit(B_JUP,    yDir < 0);
+  setBit(B_JDOWN,  yDir > 0);
+}
 
-void read_aim_switch() {
-  unsigned long now = millis();
-  bool reading = (digitalRead(AIM_PIN) == LOW);  // LOW = switch closed (pull-up)
+// ---- Sending ----
+const unsigned long HEARTBEAT_MS = 100;  // resend the snapshot at least this often
+unsigned long lastSend = 0;
 
-  if (reading != aimLastReading) {
-    aimLastChange = now;
-    aimLastReading = reading;
-  }
-
-  if ((now - aimLastChange) >= DEBOUNCE_MS && reading != aimStable) {
-    aimStable = reading;
-    Serial.println(aimStable ? "AIM_ON" : "AIM_OFF");
-  }
+void sendState() {
+  uint8_t chk = ((state >> 12) ^ (state >> 8) ^ (state >> 4) ^ state) & 0xF;
+  char buf[10];
+  snprintf(buf, sizeof(buf), "S%04X%X", state, chk);
+  bt.println(buf);
+#if DEBUG_USB
+  Serial.println(buf);
+#endif
 }
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(9600);   // USB (debug)
+  bt.begin(BT_BAUD);    // HC-05
 
   pinMode(JOY_X_PIN, INPUT);
   pinMode(JOY_Y_PIN, INPUT);
-  pinMode(SWITCH_PIN, INPUT_PULLUP);
-  pinMode(AIM_PIN, INPUT_PULLUP);
-
-  for (int i = 0; i < NUM_BUTTONS; i++) {
-    pinMode(buttons[i].pin, INPUT_PULLUP);
+  for (int i = 0; i < NUM_INPUTS; i++) {
+    pinMode(inputs[i].pin, INPUT_PULLUP);
   }
 }
 
 void loop() {
-  read_joystick();
-  read_pushbtn();
-  read_aim_switch();
+  uint16_t prev = state;
+  update_inputs();
+  update_joystick();
 
-  delay(5);
+  unsigned long now = millis();
+  if (state != prev || (now - lastSend) >= HEARTBEAT_MS) {
+    lastSend = now;
+    sendState();
+  }
+
+  delay(2);
 }
