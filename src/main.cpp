@@ -43,6 +43,8 @@ Button buttons[] = {
   {"RIGHT",    10, DIR_HOLD_DELAY_MS,   DIR_REPEAT_MS,   false, false, 0, 0},
   {"DOWN",     11, DIR_HOLD_DELAY_MS,   DIR_REPEAT_MS,   false, false, 0, 0},
   {"LEFT",     12, DIR_HOLD_DELAY_MS,   DIR_REPEAT_MS,   false, false, 0, 0},
+  // shoot (continuous)
+  {"SHOOT",    13, DIR_HOLD_DELAY_MS,   DIR_REPEAT_MS,   false, false, 0, 0},
 };
 const int NUM_BUTTONS = sizeof(buttons) / sizeof(buttons[0]);
 
@@ -95,12 +97,36 @@ void read_pushbtn() {
   }
 }
 
+// Aim switch (a latching switch, NOT a pushbutton): wired between pin 3 and GND.
+// Switch closed = aiming. Sends "AIM_ON" once when switched on and
+// "AIM_OFF" once when switched off.
+const int AIM_PIN = 3;
+bool aimStable = false;         // debounced state: true = switch on
+bool aimLastReading = false;
+unsigned long aimLastChange = 0;
+
+void read_aim_switch() {
+  unsigned long now = millis();
+  bool reading = (digitalRead(AIM_PIN) == LOW);  // LOW = switch closed (pull-up)
+
+  if (reading != aimLastReading) {
+    aimLastChange = now;
+    aimLastReading = reading;
+  }
+
+  if ((now - aimLastChange) >= DEBOUNCE_MS && reading != aimStable) {
+    aimStable = reading;
+    Serial.println(aimStable ? "AIM_ON" : "AIM_OFF");
+  }
+}
+
 void setup() {
   Serial.begin(9600);
 
   pinMode(JOY_X_PIN, INPUT);
   pinMode(JOY_Y_PIN, INPUT);
   pinMode(SWITCH_PIN, INPUT_PULLUP);
+  pinMode(AIM_PIN, INPUT_PULLUP);
 
   for (int i = 0; i < NUM_BUTTONS; i++) {
     pinMode(buttons[i].pin, INPUT_PULLUP);
@@ -110,6 +136,7 @@ void setup() {
 void loop() {
   read_joystick();
   read_pushbtn();
+  read_aim_switch();
 
   delay(5);
 }
